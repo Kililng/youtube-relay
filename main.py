@@ -23,6 +23,7 @@ YouTube yt-dlp 中转服务
 """
 
 import os
+import tempfile
 import urllib.request
 import urllib.parse
 from fastapi import FastAPI, Query
@@ -69,8 +70,20 @@ def pick_playable(data):
     return data.get("url")
 
 
+# YouTube 反爬升级后，默认 web 客户端常被要求 "Sign in to confirm you're not a bot"。
+# 改用非网页 player_client 回退（tv/ios/android/web_safari 等多端客户端），
+# 多数情况下无需登录 Cookie 即可拿到直链。仍失败时可经 cookies 参数喂登录态。
+PLAYER_CLIENTS = ["tv", "ios", "android", "web_safari", "web_embed", "web"]
+
+
 @app.get("/api/info")
-def info(url: str = Query(...)):
+def info(url: str = Query(...), cookies: str = Query(None)):
+    """解析 YouTube 直链。
+
+    cookies: 可选，Netscape 格式 cookie 文本（浏览器扩展导出的 cookies.txt 内容）。
+             仅在 player_client 回退仍被机器人检测拦截时使用。
+    """
+    tmp_cookie = None
     try:
         ydl_opts = {
             "quiet": True,
@@ -79,7 +92,14 @@ def info(url: str = Query(...)):
             "format": "best",
             "http_headers": {"User-Agent": UA},
             "nocheckcertificate": True,
+            "extractor_args": {"youtube": {"player_client": PLAYER_CLIENTS}},
         }
+        # 可选：把 Netscape 格式 cookie 文本落盘后交给 yt-dlp
+        if cookies and cookies.strip():
+            fd, tmp_cookie = tempfile.mkstemp(suffix=".txt")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(cookies)
+            ydl_opts["cookiefile"] = tmp_cookie
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             data = ydl.extract_info(url, download=False)
         video_url = pick_playable(data)
@@ -95,6 +115,12 @@ def info(url: str = Query(...)):
         }
     except Exception as e:
         return {"success": False, "error": str(e)[:300]}
+    finally:
+        if tmp_cookie and os.path.exists(tmp_cookie):
+            try:
+                os.remove(tmp_cookie)
+            except Exception:
+                pass
 
 
 def _is_googlevideo(url):

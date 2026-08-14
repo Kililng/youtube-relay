@@ -41,6 +41,9 @@ app.add_middleware(
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 
+# 部署版本标记：用于确认 Render 是否真正拉取了最新代码
+VERSION = "v2-playerclient-cookies"
+
 
 def pick_playable(data):
     """从 yt-dlp 解析结果里选一个「音画同流」的可直接播放地址（优先 mp4）。"""
@@ -114,7 +117,7 @@ def info(url: str = Query(...), cookies: str = Query(None)):
             "videoUrl": video_url,
         }
     except Exception as e:
-        return {"success": False, "error": str(e)[:300]}
+        return {"success": False, "error": str(e)[:300], "version": VERSION}
     finally:
         if tmp_cookie and os.path.exists(tmp_cookie):
             try:
@@ -202,4 +205,4 @@ def proxy(url: str = Query(...)):
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "youtube-relay"}
+    return {"ok": True, "service": "youtube-relay", "version": VERSION}

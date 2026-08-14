@@ -85,7 +85,11 @@ def info(url: str = Query(...), cookies: str = Query(None)):
 
     cookies: 可选，Netscape 格式 cookie 文本（浏览器扩展导出的 cookies.txt 内容）。
              仅在 player_client 回退仍被机器人检测拦截时使用。
+             也可通过环境变量 YT_COOKIES 统一配置（无需每次请求携带）。
     """
+    # 优先用请求参数里的 cookies；否则回退到环境变量 YT_COOKIES（Render 后台配置）
+    if not cookies or not cookies.strip():
+        cookies = os.environ.get("YT_COOKIES") or ""
     tmp_cookie = None
     try:
         ydl_opts = {

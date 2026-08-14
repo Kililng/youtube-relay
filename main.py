@@ -106,30 +106,55 @@ def _is_googlevideo(url):
         return False
 
 
+def _is_instagram_cdn(url):
+    """仅允许代理 Instagram 官方图床（scontent / fbcdn），用于把被墙/被风控的
+    IG 原图经境外 Render 抓回再缓存到云存储。严禁放通其他域名，避免开放代理滥用。"""
+    try:
+        host = (urllib.parse.urlparse(url).hostname or "").lower()
+        return (
+            host == "scontent.cdninstagram.com"
+            or host.endswith(".cdninstagram.com")
+            or host == "fbcdn.net"
+            or host.endswith(".fbcdn.net")
+        )
+    except Exception:
+        return False
+
+
+IG_UA = "Instagram 319.0.0.33.90 Android (24/7.0; 640dpi; 1440x2560; samsung; SM-G965F; star2qltecs; samsung; en_US; 519113708)"
+
+
 @app.get("/api/proxy")
 def proxy(url: str = Query(...)):
-    """视频流代理：服务端（境外 Render）直连 googlevideo 拉取并流式回传。
+    """通用媒体代理：服务端（境外 Render）直连上游拉取并流式回传。
 
-    为什么需要：Cloudflare 中继的出口 IP 被 Google CDN 按 IP 风控（403），
-    云函数无法经中继直接抓 googlevideo 文件。改为让本服务（境外 IP，可直连
-    Google）下载视频流并转发，云函数再经中继（能正常访问 Render）把视频缓存到
-    腾讯云存储，从而在国内可播放/保存。
+    放行两类域名（均严格白名单，防止开放代理滥用）：
+      - googlevideo.com：YouTube 视频流（Cloudflare 中继被 Google CDN 按 IP 风控 403，
+        改由本服务境外 IP 直连抓取后转发）。
+      - scontent*.cdninstagram.com / *.fbcdn.net：Instagram 原图。云函数所在链路经
+        Cloudflare 中继取 IG 原图同样被 Meta 按出口 IP 风控 403，且大陆直连被墙；
+        改由本服务（境外 IP 未被 Meta 封禁）抓取，云函数再经中继把图缓存到腾讯云。
     """
-    if not _is_googlevideo(url):
-        return {"success": False, "error": "仅允许代理 googlevideo.com 视频流"}
-    req = urllib.request.Request(
-        url,
-        headers={
+    if _is_googlevideo(url):
+        headers = {
             "User-Agent": UA,
             "Referer": "https://www.youtube.com/",
             "Accept": "*/*",
-        },
-    )
+        }
+    elif _is_instagram_cdn(url):
+        headers = {
+            "User-Agent": IG_UA,
+            "Referer": "https://www.instagram.com/",
+            "Accept": "image/webp,image/apng,image/*,*/*;q=0.8",
+        }
+    else:
+        return {"success": False, "error": "仅允许代理 googlevideo.com 与 Instagram 图床(scontent/fbcdn)"}
+    req = urllib.request.Request(url, headers=headers)
     try:
         upstream = urllib.request.urlopen(req, timeout=60)
     except Exception as e:
         return {"success": False, "error": "上游拉取失败: " + str(e)[:200]}
-    ctype = upstream.headers.get("Content-Type") or "video/mp4"
+    ctype = upstream.headers.get("Content-Type") or "application/octet-stream"
 
     def gen():
         try:

@@ -42,7 +42,7 @@ app.add_middleware(
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 
 # 部署版本标记：用于确认 Render 是否真正拉取了最新代码
-VERSION = "v2-playerclient-cookies"
+VERSION = "v3-header-cookies"
 
 
 def pick_playable(data):
@@ -83,7 +83,9 @@ PLAYER_CLIENTS = ["tv", "ios", "android", "web_safari", "web_embed", "web"]
 def info(url: str = Query(...), cookies: str = Query(None)):
     """解析 YouTube 直链。
 
-    cookies: 可选，Netscape 格式 cookie 文本（浏览器扩展导出的 cookies.txt 内容）。
+    cookies: 可选，登录态 cookie。支持两种格式，自动识别：
+              - Netscape 格式（浏览器扩展导出的 cookies.txt 内容，含 "# Netscape" 头）
+              - Header 串格式（Cookie-Editor 的 "Copy as Header String"，形如 "k=v; k2=v2"）
              仅在 player_client 回退仍被机器人检测拦截时使用。
              也可通过环境变量 YT_COOKIES 统一配置（无需每次请求携带）。
     """
@@ -101,12 +103,20 @@ def info(url: str = Query(...), cookies: str = Query(None)):
             "nocheckcertificate": True,
             "extractor_args": {"youtube": {"player_client": PLAYER_CLIENTS}},
         }
-        # 可选：把 Netscape 格式 cookie 文本落盘后交给 yt-dlp
+        # 可选：把 cookie 交给 yt-dlp。两种格式自动识别：
+        #   - Netscape 格式（"# Netscape HTTP Cookie File" 开头，或含 tab/换行）
+        #     → 落盘为 cookiefile 传给 --cookiefile
+        #   - Header 串格式（"k=v; k2=v2"，Cookie-Editor 的 "Copy as Header String"）
+        #     → 直接作为请求头 Cookie 注入，免落盘、对单行长文本环境变量最友好。
         if cookies and cookies.strip():
-            fd, tmp_cookie = tempfile.mkstemp(suffix=".txt")
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(cookies)
-            ydl_opts["cookiefile"] = tmp_cookie
+            text = cookies.strip()
+            if text.startswith("#") or "\t" in text or "\n" in text:
+                fd, tmp_cookie = tempfile.mkstemp(suffix=".txt")
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(text)
+                ydl_opts["cookiefile"] = tmp_cookie
+            else:
+                ydl_opts.setdefault("http_headers", {})["Cookie"] = text
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             data = ydl.extract_info(url, download=False)
         video_url = pick_playable(data)

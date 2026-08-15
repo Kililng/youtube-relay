@@ -42,7 +42,7 @@ app.add_middleware(
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 
 # 部署版本标记：用于确认 Render 是否真正拉取了最新代码
-VERSION = "v4-cookiefile-sapisidhash"
+VERSION = "v4b-chr9-netscape"
 
 
 def header_cookie_to_netscape(header_str, domain=".youtube.com"):

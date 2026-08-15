@@ -23,7 +23,9 @@ YouTube yt-dlp 中转服务
 """
 
 import os
+import io
 import tempfile
+import http.cookiejar
 import urllib.request
 import urllib.parse
 from fastapi import FastAPI, Query
@@ -52,19 +54,29 @@ def header_cookie_to_netscape(header_str, domain=".youtube.com"):
     时，才会自动为 YouTube 计算并附带 SAPISIDHASH 签名头；若仅以 http_headers 的
     Cookie 注入，YouTube 仍会判定为机器人（"Sign in to confirm you're not a bot"）。
     因此无论用户给的是 Header 串还是 Netscape，统一落盘为 cookiefile 最稳妥。
+
+    用标准库 MozillaCookieJar 生成，保证字段分隔符是真正的 TAB（手写 "\t" 在部分
+    部署环境下会被当成字面反斜杠+t 导致 yt-dlp 报 invalid Netscape format）。
     """
-    lines = ["# Netscape HTTP Cookie File", "# https://curl.se/docs/http-cookies.html"]
+    cj = http.cookiejar.MozillaCookieJar()
     for pair in header_str.split(";"):
         pair = pair.strip()
         if not pair or "=" not in pair:
             continue
         name, _, value = pair.partition("=")
-        name, value = name.strip(), value.strip()
-        # 去掉首尾可能存在的引号
-        if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
-            value = value[1:-1]
-        lines.append("\t".join([domain, "FALSE", "/", "FALSE", "0", name, value]))
-    return "\n".join(lines) + "\n"
+        name, value = name.strip(), value.strip().strip('"')
+        cookie = http.cookiejar.Cookie(
+            version=0, name=name, value=value,
+            port=None, port_specified=False,
+            domain=domain, domain_specified=True, domain_initial_dot=True,
+            path="/", path_specified=True,
+            secure=False, expires=None, discard=False,
+            comment=None, comment_url=None, rest={}, rfc2109=False,
+        )
+        cj.set_cookie(cookie)
+    buf = io.StringIO()
+    cj.save(buf, ignore_discard=True, ignore_expires=True)
+    return buf.getvalue()
 
 
 def pick_playable(data):

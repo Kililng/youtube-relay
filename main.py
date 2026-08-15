@@ -42,7 +42,7 @@ app.add_middleware(
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 
 # 部署版本标记：用于确认 Render 是否真正拉取了最新代码
-VERSION = "v4c-domainflag"
+VERSION = "v4d-formatfree"
 
 
 def header_cookie_to_netscape(header_str, domain=".youtube.com"):
@@ -126,7 +126,6 @@ def info(url: str = Query(...), cookies: str = Query(None)):
             "quiet": True,
             "no_warnings": True,
             "skip_download": True,
-            "format": "best",
             "http_headers": {"User-Agent": UA},
             "nocheckcertificate": True,
             "extractor_args": {"youtube": {"player_client": PLAYER_CLIENTS}},

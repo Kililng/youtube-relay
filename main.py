@@ -42,7 +42,7 @@ app.add_middleware(
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 
 # 部署版本标记：用于确认 Render 是否真正拉取了最新代码
-VERSION = "v4e-formatfallback"
+VERSION = "v5-web-progressive"
 
 
 def header_cookie_to_netscape(header_str, domain=".youtube.com"):
@@ -122,6 +122,14 @@ def info(url: str = Query(...), cookies: str = Query(None)):
         cookies = os.environ.get("YT_COOKIES") or ""
     tmp_cookie = None
     try:
+        # 有 cookie：优先用 web 客户端——它会返回 progressive 渐进式格式（18/22 等，
+        # 音画同流，小程序 <video> 可直接播/存）；cookie 经 SAPISIDHASH 自动绕过 bot 墙。
+        # 无 cookie：退回 tv/ios 等非网页客户端，尽量免登录拿到直链。
+        player_clients = (
+            ["web", "web_safari", "android", "tv", "ios"]
+            if cookies and cookies.strip()
+            else PLAYER_CLIENTS
+        )
         ydl_opts = {
             "quiet": True,
             "no_warnings": True,
@@ -129,7 +137,7 @@ def info(url: str = Query(...), cookies: str = Query(None)):
             "format": "best",
             "http_headers": {"User-Agent": UA},
             "nocheckcertificate": True,
-            "extractor_args": {"youtube": {"player_client": PLAYER_CLIENTS}},
+            "extractor_args": {"youtube": {"player_client": player_clients}},
         }
         # 可选：把 cookie 交给 yt-dlp。统一落盘为 Netscape cookiefile——
         # 这样 yt-dlp 才会自动计算并附带 YouTube 所需的 SAPISIDHASH 签名头，
@@ -147,21 +155,24 @@ def info(url: str = Query(...), cookies: str = Query(None)):
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(cookie_text)
             ydl_opts["cookiefile"] = tmp_cookie
-        # 先用 format="best" 触发带 cookie 的 player API 路径（绕过 bot 墙）。
-        # 个别视频没有 progressive 直链格式，"best" 会报 "Requested format is not
-        # available"，此时回退到 360p 渐进式格式 18（几乎所有公开视频都有）。
+        # format="best" 触发带 cookie 的 player API 路径（绕过 bot 墙）。
+        # 抓全量格式后用 pick_playable 挑「音画同流」的渐进式 mp4；
+        # 个别视频没有渐进式直链时，再强制回退到 360p 渐进式格式 18（几乎所有公开视频都有）。
         video_url = None
         last_err = None
-        for fmt in ("best", "18"):
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                data = ydl.extract_info(url, download=False)
+            video_url = pick_playable(data)
+        except Exception as e:
+            last_err = e
+        if not video_url:
             try:
-                with yt_dlp.YoutubeDL({**ydl_opts, "format": fmt}) as ydl:
+                with yt_dlp.YoutubeDL({**ydl_opts, "format": "18"}) as ydl:
                     data = ydl.extract_info(url, download=False)
-                video_url = pick_playable(data)
-                if video_url:
-                    break
+                video_url = pick_playable(data) or data.get("url")
             except Exception as e:
-                last_err = e
-                continue
+                last_err = last_err or e
         if not video_url:
             return {"success": False, "error": str(last_err)[:300], "version": VERSION}
         return {

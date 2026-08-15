@@ -42,7 +42,7 @@ app.add_middleware(
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 
 # 部署版本标记：用于确认 Render 是否真正拉取了最新代码
-VERSION = "v5-web-progressive"
+VERSION = "v5b-debug"
 
 
 def header_cookie_to_netscape(header_str, domain=".youtube.com"):
@@ -107,7 +107,7 @@ PLAYER_CLIENTS = ["tv", "ios", "android", "web_safari", "web_embed", "web"]
 
 
 @app.get("/api/info")
-def info(url: str = Query(...), cookies: str = Query(None)):
+def info(url: str = Query(...), cookies: str = Query(None), debug: str = Query(None)):
     """解析 YouTube 直链。
 
     cookies: 可选，登录态 cookie。支持两种格式，自动识别并统一转为 Netscape cookiefile：
@@ -155,6 +155,33 @@ def info(url: str = Query(...), cookies: str = Query(None)):
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(cookie_text)
             ydl_opts["cookiefile"] = tmp_cookie
+        # 诊断模式：debug=1 时直接返回 YouTube 给到的格式清单（不强制 format），
+        # 用于排查为何 pick_playable 拿不到直链。仅本地/临时排障使用。
+        if debug:
+            try:
+                with yt_dlp.YoutubeDL({**ydl_opts, "format": None}) as ydl:
+                    d = ydl.extract_info(url, download=False)
+                fmts = [
+                    {
+                        "id": f.get("format_id"),
+                        "ext": f.get("ext"),
+                        "acodec": f.get("acodec"),
+                        "vcodec": f.get("vcodec"),
+                        "height": f.get("height"),
+                        "has_url": bool(f.get("url")),
+                    }
+                    for f in (d.get("formats") or [])
+                ]
+                return {
+                    "success": True,
+                    "debug": True,
+                    "title": d.get("title"),
+                    "format_count": len(fmts),
+                    "formats": fmts[:60],
+                    "version": VERSION,
+                }
+            except Exception as e:
+                return {"success": False, "debug": True, "debug_error": str(e)[:500], "version": VERSION}
         # format="best" 触发带 cookie 的 player API 路径（绕过 bot 墙）。
         # 抓全量格式后用 pick_playable 挑「音画同流」的渐进式 mp4；
         # 个别视频没有渐进式直链时，再强制回退到 360p 渐进式格式 18（几乎所有公开视频都有）。

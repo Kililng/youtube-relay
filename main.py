@@ -42,7 +42,7 @@ app.add_middleware(
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 
 # 部署版本标记：用于确认 Render 是否真正拉取了最新代码
-VERSION = "v4d-formatfree"
+VERSION = "v4e-formatfallback"
 
 
 def header_cookie_to_netscape(header_str, domain=".youtube.com"):
@@ -126,6 +126,7 @@ def info(url: str = Query(...), cookies: str = Query(None)):
             "quiet": True,
             "no_warnings": True,
             "skip_download": True,
+            "format": "best",
             "http_headers": {"User-Agent": UA},
             "nocheckcertificate": True,
             "extractor_args": {"youtube": {"player_client": PLAYER_CLIENTS}},
@@ -146,11 +147,23 @@ def info(url: str = Query(...), cookies: str = Query(None)):
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(cookie_text)
             ydl_opts["cookiefile"] = tmp_cookie
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            data = ydl.extract_info(url, download=False)
-        video_url = pick_playable(data)
+        # 先用 format="best" 触发带 cookie 的 player API 路径（绕过 bot 墙）。
+        # 个别视频没有 progressive 直链格式，"best" 会报 "Requested format is not
+        # available"，此时回退到 360p 渐进式格式 18（几乎所有公开视频都有）。
+        video_url = None
+        last_err = None
+        for fmt in ("best", "18"):
+            try:
+                with yt_dlp.YoutubeDL({**ydl_opts, "format": fmt}) as ydl:
+                    data = ydl.extract_info(url, download=False)
+                video_url = pick_playable(data)
+                if video_url:
+                    break
+            except Exception as e:
+                last_err = e
+                continue
         if not video_url:
-            return {"success": False, "error": "未找到可用的视频直链"}
+            return {"success": False, "error": str(last_err)[:300], "version": VERSION}
         return {
             "success": True,
             "title": data.get("title"),

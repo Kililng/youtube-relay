@@ -42,7 +42,29 @@ app.add_middleware(
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 
 # 部署版本标记：用于确认 Render 是否真正拉取了最新代码
-VERSION = "v3-header-cookies"
+VERSION = "v4-cookiefile-sapisidhash"
+
+
+def header_cookie_to_netscape(header_str, domain=".youtube.com"):
+    """把 Cookie-Editor 的 Header 串（"k=v; k2=v2"）转成 Netscape cookies.txt 文本。
+
+    yt-dlp 只有在把 cookie 解析进自己的 cookie jar（即 --cookiefile / Netscape 格式）
+    时，才会自动为 YouTube 计算并附带 SAPISIDHASH 签名头；若仅以 http_headers 的
+    Cookie 注入，YouTube 仍会判定为机器人（"Sign in to confirm you're not a bot"）。
+    因此无论用户给的是 Header 串还是 Netscape，统一落盘为 cookiefile 最稳妥。
+    """
+    lines = ["# Netscape HTTP Cookie File", "# https://curl.se/docs/http-cookies.html"]
+    for pair in header_str.split(";"):
+        pair = pair.strip()
+        if not pair or "=" not in pair:
+            continue
+        name, _, value = pair.partition("=")
+        name, value = name.strip(), value.strip()
+        # 去掉首尾可能存在的引号
+        if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
+            value = value[1:-1]
+        lines.append("\t".join([domain, "FALSE", "/", "FALSE", "0", name, value]))
+    return "\n".join(lines) + "\n"
 
 
 def pick_playable(data):
@@ -83,10 +105,11 @@ PLAYER_CLIENTS = ["tv", "ios", "android", "web_safari", "web_embed", "web"]
 def info(url: str = Query(...), cookies: str = Query(None)):
     """解析 YouTube 直链。
 
-    cookies: 可选，登录态 cookie。支持两种格式，自动识别：
+    cookies: 可选，登录态 cookie。支持两种格式，自动识别并统一转为 Netscape cookiefile：
               - Netscape 格式（浏览器扩展导出的 cookies.txt 内容，含 "# Netscape" 头）
               - Header 串格式（Cookie-Editor 的 "Copy as Header String"，形如 "k=v; k2=v2"）
-             仅在 player_client 回退仍被机器人检测拦截时使用。
+              必须用 cookiefile（而非仅 http_headers），yt-dlp 才会自动计算 YouTube
+              所需的 SAPISIDHASH 签名头，绕过 "Sign in to confirm you're not a bot"。
              也可通过环境变量 YT_COOKIES 统一配置（无需每次请求携带）。
     """
     # 优先用请求参数里的 cookies；否则回退到环境变量 YT_COOKIES（Render 后台配置）
@@ -103,20 +126,22 @@ def info(url: str = Query(...), cookies: str = Query(None)):
             "nocheckcertificate": True,
             "extractor_args": {"youtube": {"player_client": PLAYER_CLIENTS}},
         }
-        # 可选：把 cookie 交给 yt-dlp。两种格式自动识别：
-        #   - Netscape 格式（"# Netscape HTTP Cookie File" 开头，或含 tab/换行）
-        #     → 落盘为 cookiefile 传给 --cookiefile
-        #   - Header 串格式（"k=v; k2=v2"，Cookie-Editor 的 "Copy as Header String"）
-        #     → 直接作为请求头 Cookie 注入，免落盘、对单行长文本环境变量最友好。
+        # 可选：把 cookie 交给 yt-dlp。统一落盘为 Netscape cookiefile——
+        # 这样 yt-dlp 才会自动计算并附带 YouTube 所需的 SAPISIDHASH 签名头，
+        # 否则仅以 Cookie 请求头注入仍会被判机器人。
+        #   - 已是 Netscape 格式（"# Netscape" 开头 / 含 tab 或换行）→ 直接落盘
+        #   - Header 串格式（Cookie-Editor "Copy as Header String"，"k=v; k2=v2"）
+        #     → 先转成 Netscape 再落盘
         if cookies and cookies.strip():
             text = cookies.strip()
             if text.startswith("#") or "\t" in text or "\n" in text:
-                fd, tmp_cookie = tempfile.mkstemp(suffix=".txt")
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    f.write(text)
-                ydl_opts["cookiefile"] = tmp_cookie
+                cookie_text = text
             else:
-                ydl_opts.setdefault("http_headers", {})["Cookie"] = text
+                cookie_text = header_cookie_to_netscape(text)
+            fd, tmp_cookie = tempfile.mkstemp(suffix=".txt")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(cookie_text)
+            ydl_opts["cookiefile"] = tmp_cookie
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             data = ydl.extract_info(url, download=False)
         video_url = pick_playable(data)

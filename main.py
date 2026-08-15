@@ -42,7 +42,7 @@ app.add_middleware(
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 
 # 部署版本标记：用于确认 Render 是否真正拉取了最新代码
-VERSION = "v4b-chr9-netscape"
+VERSION = "v4c-domainflag"
 
 
 def header_cookie_to_netscape(header_str, domain=".youtube.com"):
@@ -58,13 +58,17 @@ def header_cookie_to_netscape(header_str, domain=".youtube.com"):
     """
     TAB = chr(9)
     lines = ["# Netscape HTTP Cookie File", "# https://curl.se/docs/http-cookies.html"]
+    # http.cookiejar 的 _really_load 断言 domain_specified == initial_dot：
+    # 域名以 "." 开头（initial_dot=True）时，domain_specified 字段必须为 "TRUE"，
+    # 否则触发 AssertionError 被 yt-dlp 包装成 "invalid Netscape format"。
+    domain_specified = "TRUE" if domain.startswith(".") else "FALSE"
     for pair in header_str.split(";"):
         pair = pair.strip()
         if not pair or "=" not in pair:
             continue
         name, _, value = pair.partition("=")
         name, value = name.strip(), value.strip().strip('"')
-        lines.append(TAB.join([domain, "FALSE", "/", "FALSE", "0", name, value]))
+        lines.append(TAB.join([domain, domain_specified, "/", "FALSE", "0", name, value]))
     return "\n".join(lines) + "\n"
 
 

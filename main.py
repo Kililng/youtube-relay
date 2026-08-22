@@ -1,28 +1,17 @@
 """
-YouTube yt-dlp 中转服务
-======================
-给微信小程序 media-collector 用的「YouTube 视频直链」中继。
+YouTube yt-dlp 中转服务 + Instagram GraphQL 无 Cookie 解析
+==================================================
+给微信小程序 media-collector 用的媒体中继。
 
-为什么需要它：
-  YouTube 视频文件带签名防盗，云函数无法直接拿到可下载地址。
-  本服务跑在境外主机（Render / Railway 等），用 yt-dlp 解析出
-  真实直链后返回给云函数，云函数再经 relay 缓存到腾讯云存储，
-  小程序即可在国内直接播放/保存。
-
-接口：
-  GET /api/info?url=<YouTube链接>
-  返回 JSON：
-    {
-      "success": true,
-      "title": "...",
-      "author": "...",
-      "thumbnail": "https://...jpg",
-      "duration": 123,
-      "videoUrl": "https://rN---sn-xxx.googlevideo.com/videoplayback?..."
-    }
+功能：
+  1. GET /api/info?url=<YouTube链接>  —— yt-dlp 解析 YouTube 视频直链
+  2. GET /api/instagram?url=<IG链接>   —— GraphQL 无 cookie 解析 IG 帖子/Reel
+  3. GET /api/proxy?url=<媒体URL>       —— 代理 googlevideo / IG 图床流
 """
 
 import os
+import re
+import json
 import tempfile
 import urllib.request
 import urllib.parse
@@ -42,7 +31,7 @@ app.add_middleware(
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 
 # 部署版本标记：用于确认 Render 是否真正拉取了最新代码
-VERSION = "v5-final"
+VERSION = "v6-ig-graphql"
 
 
 def header_cookie_to_netscape(header_str, domain=".youtube.com"):
@@ -268,6 +257,167 @@ def proxy(url: str = Query(...)):
                 pass
 
     return StreamingResponse(gen(), media_type=ctype)
+
+
+# ──────────────────────────────────────────────────────────────────
+# Instagram GraphQL 无 Cookie 解析
+# ──────────────────────────────────────────────────────────────────
+# 原理：Instagram 的 GraphQL 端点（/api/graphql）可以用固定的 doc_id
+# 查询帖子媒体，不需要登录 cookie。只需要：
+#   - User-Agent（任何浏览器 UA）
+#   - X-IG-App-ID（公开固定值 936619743392459，不是密钥，不会过期）
+#   - lsd token（从帖子页面 HTML 抓取，每次会变，但不是登录凭证）
+#
+# 参考：https://github.com/ahmedrangel/instagram-media-scraper (Method 2)
+
+IG_APP_ID = "936619743392459"
+IG_BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+
+
+def _extract_shortcode(url):
+    """从 Instagram URL 提取 shortcode。支持 /p/xxx /reel/xxx /reels/xxx /tv/xxx"""
+    m = re.search(r"instagram\.com/(?:[^/]+/)?(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)", url)
+    return m.group(1) if m else None
+
+
+def _scrape_lsd(shortcode):
+    """从 Instagram 帖子页面 HTML 抓取 fresh lsd token（CSRF 标识，非登录凭证）。"""
+    page_url = f"https://www.instagram.com/p/{shortcode}/"
+    req = urllib.request.Request(page_url, headers={
+        "User-Agent": IG_BROWSER_UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Sec-Fetch-Site": "none",
+    })
+    try:
+        r = urllib.request.urlopen(req, timeout=15)
+        html = r.read().decode("utf-8", errors="replace")
+        # lsd token 通常在 "LSD":{"token":"..."} 或 "lsd":"..." 里
+        m = re.search(r'"LSD"\s*,\s*\[\s*\{"token"\s*:\s*"([^"]+)"', html)
+        if not m:
+            m = re.search(r'"lsd"\s*:\s*"([^"]+)"', html)
+        if not m:
+            m = re.search(r'"LSD"\s*:\s*\{"token"\s*:\s*"([^"]+)"', html)
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+
+def _graphql_query(shortcode, lsd):
+    """向 Instagram GraphQL 端点发起查询，返回解析后的 JSON。"""
+    variables = json.dumps({"shortcode": shortcode})
+    # 参数放在 query string 上（而非 body），这是该端点的约定
+    full_url = (
+        f"https://www.instagram.com/api/graphql"
+        f"?variables={urllib.parse.quote(variables)}"
+        f"&doc_id=10015901848480474"
+        f"&lsd={urllib.parse.quote(lsd)}"
+    )
+    req = urllib.request.Request(full_url, data=b"", method="POST", headers={
+        "User-Agent": IG_BROWSER_UA,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "X-IG-App-ID": IG_APP_ID,
+        "X-FB-LSD": lsd,
+        "X-ASBD-ID": "129477",
+        "Sec-Fetch-Site": "same-origin",
+        "Accept": "*/*",
+    })
+    r = urllib.request.urlopen(req, timeout=15)
+    return json.loads(r.read().decode())
+
+
+def _parse_ig_media(media):
+    """把 GraphQL 返回的 xdt_shortcode_media 解析成统一的 mediaList。"""
+    if not media:
+        return None
+    media_list = []
+    typename = media.get("__typename", "")
+    is_video = media.get("is_video", False)
+
+    # 单图/单视频
+    def push_node(node):
+        node_is_video = node.get("is_video", False)
+        img_url = node.get("display_url") or ""
+        thumb = node.get("thumbnail_src") or img_url
+        if node_is_video and node.get("video_url"):
+            media_list.append({"url": node["video_url"], "type": "video", "thumbnail": thumb})
+        elif img_url:
+            media_list.append({"url": img_url, "type": "image", "thumbnail": thumb})
+
+    # 多图轮播
+    sidecar = media.get("edge_sidecar_to_children")
+    if sidecar and sidecar.get("edges"):
+        for edge in sidecar["edges"]:
+            push_node(edge.get("node", {}))
+    else:
+        push_node(media)
+
+    if not media_list:
+        return None
+
+    caption_edges = media.get("edge_media_to_caption", {}).get("edges", [])
+    caption = caption_edges[0]["node"]["text"] if caption_edges else ""
+    owner = media.get("owner", {}).get("username", "")
+
+    return {
+        "mediaList": media_list,
+        "title": caption[:80] if caption else "Instagram帖子",
+        "author": f"@{owner}" if owner else "",
+    }
+
+
+@app.get("/api/instagram")
+def instagram(url: str = Query(...)):
+    """Instagram 无 Cookie 解析（GraphQL 法）。
+
+    不需要任何登录 cookie，通过 IG 的 GraphQL 端点直接查询公开帖子媒体。
+    支持单图、视频、多图轮播（carousel）。
+
+    流程：
+      1. 从 URL 提取 shortcode
+      2. 先试硬编码 lsd token（快，但可能过期）
+      3. 失败则从帖子页面 HTML 抓取 fresh lsd 后重试
+      4. 解析 GraphQL 响应，返回统一的 mediaList
+    """
+    shortcode = _extract_shortcode(url)
+    if not shortcode:
+        return {"success": False, "error": "无法从 URL 提取 shortcode", "version": VERSION}
+
+    # 尝试用的 lsd token 列表：先试硬编码（快），再试从页面抓取的（新鲜）
+    LSD_FALLBACK = "AVqbxe3J_YA"
+    lsds_to_try = [LSD_FALLBACK]
+
+    result = None
+    for i, lsd in enumerate(lsds_to_try):
+        try:
+            j = _graphql_query(shortcode, lsd)
+            media = (j.get("data") or {}).get("xdt_shortcode_media")
+            if media:
+                result = _parse_ig_media(media)
+                if result:
+                    break
+        except urllib.error.HTTPError as e:
+            body = e.read().decode()[:200]
+            # 403/429 = lsd 过期或被限流，尝试抓 fresh lsd
+            if e.code in (403, 429) and i == 0:
+                fresh_lsd = _scrape_lsd(shortcode)
+                if fresh_lsd and fresh_lsd != LSD_FALLBACK:
+                    lsds_to_try.append(fresh_lsd)
+                continue
+            return {"success": False, "error": f"HTTP {e.code}: {body}", "version": VERSION}
+        except Exception as e:
+            if i == 0:
+                # 未知错误也尝试抓 fresh lsd
+                fresh_lsd = _scrape_lsd(shortcode)
+                if fresh_lsd and fresh_lsd != LSD_FALLBACK:
+                    lsds_to_try.append(fresh_lsd)
+                continue
+            return {"success": False, "error": str(e)[:200], "version": VERSION}
+
+    if not result:
+        return {"success": False, "error": "GraphQL 查询返回空数据，帖子可能不存在或为私密账户", "version": VERSION}
+
+    return {"success": True, **result, "version": VERSION}
 
 
 @app.get("/")

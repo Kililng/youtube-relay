@@ -31,7 +31,7 @@ app.add_middleware(
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 
 # 部署版本标记：用于确认 Render 是否真正拉取了最新代码
-VERSION = "v6-ig-graphql"
+VERSION = "v6b-ig-debug"
 
 
 def header_cookie_to_netscape(header_str, domain=".youtube.com"):
@@ -367,7 +367,7 @@ def _parse_ig_media(media):
 
 
 @app.get("/api/instagram")
-def instagram(url: str = Query(...)):
+def instagram(url: str = Query(...), debug: str = Query(None)):
     """Instagram 无 Cookie 解析（GraphQL 法）。
 
     不需要任何登录 cookie，通过 IG 的 GraphQL 端点直接查询公开帖子媒体。
@@ -388,33 +388,63 @@ def instagram(url: str = Query(...)):
     lsds_to_try = [LSD_FALLBACK]
 
     result = None
+    debug_info = {"shortcode": shortcode, "lsds_tried": [], "graphql_responses": []}
     for i, lsd in enumerate(lsds_to_try):
+        debug_info["lsds_tried"].append(lsd)
         try:
             j = _graphql_query(shortcode, lsd)
+            if debug:
+                debug_info["graphql_responses"].append(json.dumps(j)[:800])
             media = (j.get("data") or {}).get("xdt_shortcode_media")
             if media:
                 result = _parse_ig_media(media)
                 if result:
                     break
         except urllib.error.HTTPError as e:
-            body = e.read().decode()[:200]
+            body = e.read().decode()[:300]
+            debug_info["graphql_responses"].append(f"HTTP {e.code}: {body}")
             # 403/429 = lsd 过期或被限流，尝试抓 fresh lsd
             if e.code in (403, 429) and i == 0:
                 fresh_lsd = _scrape_lsd(shortcode)
                 if fresh_lsd and fresh_lsd != LSD_FALLBACK:
                     lsds_to_try.append(fresh_lsd)
                 continue
+            if debug:
+                return {"success": False, "error": f"HTTP {e.code}: {body}", "debug": debug_info, "version": VERSION}
             return {"success": False, "error": f"HTTP {e.code}: {body}", "version": VERSION}
         except Exception as e:
+            debug_info["graphql_responses"].append(f"ERR: {str(e)[:300]}")
             if i == 0:
                 # 未知错误也尝试抓 fresh lsd
                 fresh_lsd = _scrape_lsd(shortcode)
                 if fresh_lsd and fresh_lsd != LSD_FALLBACK:
                     lsds_to_try.append(fresh_lsd)
                 continue
+            if debug:
+                return {"success": False, "error": str(e)[:200], "debug": debug_info, "version": VERSION}
             return {"success": False, "error": str(e)[:200], "version": VERSION}
 
     if not result:
+        # 最后尝试：主动抓 fresh lsd 再试一次
+        fresh_lsd = _scrape_lsd(shortcode)
+        if fresh_lsd and fresh_lsd not in lsds_to_try:
+            debug_info["lsds_tried"].append(fresh_lsd)
+            try:
+                j = _graphql_query(shortcode, fresh_lsd)
+                if debug:
+                    debug_info["graphql_responses"].append(json.dumps(j)[:800])
+                media = (j.get("data") or {}).get("xdt_shortcode_media")
+                if media:
+                    result = _parse_ig_media(media)
+            except urllib.error.HTTPError as e:
+                body = e.read().decode()[:300]
+                debug_info["graphql_responses"].append(f"HTTP {e.code}: {body}")
+            except Exception as e:
+                debug_info["graphql_responses"].append(f"ERR: {str(e)[:300]}")
+
+    if not result:
+        if debug:
+            return {"success": False, "error": "GraphQL 查询返回空数据", "debug": debug_info, "version": VERSION}
         return {"success": False, "error": "GraphQL 查询返回空数据，帖子可能不存在或为私密账户", "version": VERSION}
 
     return {"success": True, **result, "version": VERSION}

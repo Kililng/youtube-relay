@@ -31,7 +31,7 @@ app.add_middleware(
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 
 # 部署版本标记：用于确认 Render 是否真正拉取了最新代码
-VERSION = "v6b-ig-debug"
+VERSION = "v6c-ig-html"
 
 
 def header_cookie_to_netscape(header_str, domain=".youtube.com"):
@@ -260,17 +260,12 @@ def proxy(url: str = Query(...)):
 
 
 # ──────────────────────────────────────────────────────────────────
-# Instagram GraphQL 无 Cookie 解析
+# Instagram 无 Cookie 解析（页面 HTML 抓取）
 # ──────────────────────────────────────────────────────────────────
-# 原理：Instagram 的 GraphQL 端点（/api/graphql）可以用固定的 doc_id
-# 查询帖子媒体，不需要登录 cookie。只需要：
-#   - User-Agent（任何浏览器 UA）
-#   - X-IG-App-ID（公开固定值 936619743392459，不是密钥，不会过期）
-#   - lsd token（从帖子页面 HTML 抓取，每次会变，但不是登录凭证）
-#
-# 参考：https://github.com/ahmedrangel/instagram-media-scraper (Method 2)
+# 从 Render（境外 IP）GET Instagram 帖子页面，提取嵌入的 JSON 和 OG meta tags。
+# 不需要 cookie / lsd / doc_id，不依赖任何会过期的 token。
+# 受 IG 对匿名访问的风控影响，不保证 100% 成功。
 
-IG_APP_ID = "936619743392459"
 IG_BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 
 
@@ -280,174 +275,158 @@ def _extract_shortcode(url):
     return m.group(1) if m else None
 
 
-def _scrape_lsd(shortcode):
-    """从 Instagram 帖子页面 HTML 抓取 fresh lsd token（CSRF 标识，非登录凭证）。"""
+def _fetch_ig_page(shortcode):
+    """从 Render（境外 IP）直接 GET Instagram 帖子页面，返回 HTML 文本。"""
     page_url = f"https://www.instagram.com/p/{shortcode}/"
     req = urllib.request.Request(page_url, headers={
         "User-Agent": IG_BROWSER_UA,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
         "Sec-Fetch-Site": "none",
-    })
-    try:
-        r = urllib.request.urlopen(req, timeout=15)
-        html = r.read().decode("utf-8", errors="replace")
-        # lsd token 通常在 "LSD":{"token":"..."} 或 "lsd":"..." 里
-        m = re.search(r'"LSD"\s*,\s*\[\s*\{"token"\s*:\s*"([^"]+)"', html)
-        if not m:
-            m = re.search(r'"lsd"\s*:\s*"([^"]+)"', html)
-        if not m:
-            m = re.search(r'"LSD"\s*:\s*\{"token"\s*:\s*"([^"]+)"', html)
-        return m.group(1) if m else None
-    except Exception:
-        return None
-
-
-def _graphql_query(shortcode, lsd):
-    """向 Instagram GraphQL 端点发起查询，返回解析后的 JSON。"""
-    variables = json.dumps({"shortcode": shortcode})
-    # 参数放在 query string 上（而非 body），这是该端点的约定
-    full_url = (
-        f"https://www.instagram.com/api/graphql"
-        f"?variables={urllib.parse.quote(variables)}"
-        f"&doc_id=10015901848480474"
-        f"&lsd={urllib.parse.quote(lsd)}"
-    )
-    req = urllib.request.Request(full_url, data=b"", method="POST", headers={
-        "User-Agent": IG_BROWSER_UA,
-        "Content-Type": "application/x-www-form-urlencoded",
-        "X-IG-App-ID": IG_APP_ID,
-        "X-FB-LSD": lsd,
-        "X-ASBD-ID": "129477",
-        "Sec-Fetch-Site": "same-origin",
-        "Accept": "*/*",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-User": "?1",
     })
     r = urllib.request.urlopen(req, timeout=15)
-    return json.loads(r.read().decode())
+    return r.read().decode("utf-8", errors="replace")
 
 
-def _parse_ig_media(media):
-    """把 GraphQL 返回的 xdt_shortcode_media 解析成统一的 mediaList。"""
-    if not media:
-        return None
+def _parse_og_meta(html):
+    """从页面 HTML 提取 Open Graph meta tags。"""
+    result = {}
+    for prop in ("og:image", "og:video", "og:video:url", "og:video:secure_url", "og:title", "og:description"):
+        m = re.search(r'<meta\s+(?:property|name)="' + re.escape(prop) + r'"\s+content="([^"]+)"', html, re.I)
+        if m:
+            key = prop.replace("og:video:url", "og:video").replace("og:video:secure_url", "og:video")
+            if key not in result:
+                result[key] = m.group(1)
+    return result
+
+
+def _parse_embedded_media(html):
+    """从页面 HTML 提取嵌入的 shortcode_media JSON 块。"""
+    # 方法 1：<script type="application/ld+json">
+    for m in re.finditer(r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>', html, re.S):
+        try:
+            data = json.loads(m.group(1))
+            if isinstance(data, dict):
+                if data.get("contentUrl"):
+                    return {"display_url": data.get("thumbnailUrl", data.get("image", "")),
+                            "video_url": data.get("contentUrl"), "is_video": True,
+                            "owner": {"username": data.get("author", {}).get("name", "")},
+                            "edge_media_to_caption": {"edges": [{"node": {"text": data.get("caption", "")}}]}}
+                graph = data.get("@graph", [])
+                for item in graph:
+                    if item.get("contentUrl"):
+                        return {"display_url": item.get("thumbnailUrl", item.get("image", "")),
+                                "video_url": item.get("contentUrl"), "is_video": True,
+                                "owner": {"username": item.get("author", {}).get("name", "")},
+                                "edge_media_to_caption": {"edges": [{"node": {"text": item.get("caption", "")}}]}}
+        except json.JSONDecodeError:
+            continue
+
+    # 方法 2：window._sharedData
+    m = re.search(r'window\._sharedData\s*=\s*(\{.+?\})\s*;\s*</script>', html, re.S)
+    if m:
+        try:
+            data = json.loads(m.group(1))
+            entry = (data.get("entry_data") or {}).get("PostPage") or []
+            if entry:
+                media = entry[0].get("graphql", {}).get("shortcode_media")
+                if media and (media.get("display_url") or media.get("video_url")):
+                    return media
+        except json.JSONDecodeError:
+            pass
+
+    # 方法 3：直接搜索 "shortcode_media" JSON 块
+    m = re.search(r'"shortcode_media"\s*:\s*(\{.+?"display_url"\s*:\s*"[^"]+".*?\})\s*[,}]', html, re.S)
+    if m:
+        try:
+            media = json.loads(m.group(1))
+            if media.get("display_url") or media.get("video_url"):
+                return media
+        except json.JSONDecodeError:
+            pass
+
+    return None
+
+
+def _build_media_list(media):
+    """从解析出的 media JSON 构造统一 mediaList。"""
     media_list = []
-    typename = media.get("__typename", "")
-    is_video = media.get("is_video", False)
-
-    # 单图/单视频
     def push_node(node):
-        node_is_video = node.get("is_video", False)
-        img_url = node.get("display_url") or ""
-        thumb = node.get("thumbnail_src") or img_url
-        if node_is_video and node.get("video_url"):
-            media_list.append({"url": node["video_url"], "type": "video", "thumbnail": thumb})
-        elif img_url:
-            media_list.append({"url": img_url, "type": "image", "thumbnail": thumb})
+        n_is_video = node.get("is_video", False)
+        n_img = node.get("display_url") or ""
+        n_thumb = node.get("thumbnail_src") or n_img
+        if n_is_video and node.get("video_url"):
+            media_list.append({"url": node["video_url"], "type": "video", "thumbnail": n_thumb})
+        elif n_img:
+            media_list.append({"url": n_img, "type": "image", "thumbnail": n_thumb})
 
-    # 多图轮播
     sidecar = media.get("edge_sidecar_to_children")
     if sidecar and sidecar.get("edges"):
         for edge in sidecar["edges"]:
             push_node(edge.get("node", {}))
     else:
         push_node(media)
-
-    if not media_list:
-        return None
-
-    caption_edges = media.get("edge_media_to_caption", {}).get("edges", [])
-    caption = caption_edges[0]["node"]["text"] if caption_edges else ""
-    owner = media.get("owner", {}).get("username", "")
-
-    return {
-        "mediaList": media_list,
-        "title": caption[:80] if caption else "Instagram帖子",
-        "author": f"@{owner}" if owner else "",
-    }
+    return media_list
 
 
 @app.get("/api/instagram")
 def instagram(url: str = Query(...), debug: str = Query(None)):
-    """Instagram 无 Cookie 解析（GraphQL 法）。
+    """Instagram 无 Cookie 解析（页面 HTML 抓取法）。
 
-    不需要任何登录 cookie，通过 IG 的 GraphQL 端点直接查询公开帖子媒体。
-    支持单图、视频、多图轮播（carousel）。
-
-    流程：
-      1. 从 URL 提取 shortcode
-      2. 先试硬编码 lsd token（快，但可能过期）
-      3. 失败则从帖子页面 HTML 抓取 fresh lsd 后重试
-      4. 解析 GraphQL 响应，返回统一的 mediaList
+    从 Render 境外 IP 直接 GET 帖子页面，提取嵌入 JSON 和 OG meta tags。
+    不需要任何登录 cookie。
     """
     shortcode = _extract_shortcode(url)
     if not shortcode:
         return {"success": False, "error": "无法从 URL 提取 shortcode", "version": VERSION}
 
-    # 尝试用的 lsd token 列表：先试硬编码（快），再试从页面抓取的（新鲜）
-    LSD_FALLBACK = "AVqbxe3J_YA"
-    lsds_to_try = [LSD_FALLBACK]
+    dbg = {"shortcode": shortcode, "steps": []}
 
-    result = None
-    debug_info = {"shortcode": shortcode, "lsds_tried": [], "graphql_responses": []}
-    for i, lsd in enumerate(lsds_to_try):
-        debug_info["lsds_tried"].append(lsd)
-        try:
-            j = _graphql_query(shortcode, lsd)
-            if debug:
-                debug_info["graphql_responses"].append(json.dumps(j)[:800])
-            media = (j.get("data") or {}).get("xdt_shortcode_media")
+    # ── 抓页面 HTML ──
+    try:
+        html = _fetch_ig_page(shortcode)
+        dbg["html_length"] = len(html)
+        is_login = any(x in html for x in ("loginForm", "LoginAndSignupPage", "Log into Facebook"))
+        dbg["is_login_page"] = is_login
+
+        if is_login:
+            dbg["steps"].append("login_page: IG 要求登录")
+        else:
+            # A1: 嵌入 JSON
+            media = _parse_embedded_media(html)
             if media:
-                result = _parse_ig_media(media)
-                if result:
-                    break
-        except urllib.error.HTTPError as e:
-            body = e.read().decode()[:300]
-            debug_info["graphql_responses"].append(f"HTTP {e.code}: {body}")
-            # 403/429 = lsd 过期或被限流，尝试抓 fresh lsd
-            if e.code in (403, 429) and i == 0:
-                fresh_lsd = _scrape_lsd(shortcode)
-                if fresh_lsd and fresh_lsd != LSD_FALLBACK:
-                    lsds_to_try.append(fresh_lsd)
-                continue
-            if debug:
-                return {"success": False, "error": f"HTTP {e.code}: {body}", "debug": debug_info, "version": VERSION}
-            return {"success": False, "error": f"HTTP {e.code}: {body}", "version": VERSION}
-        except Exception as e:
-            debug_info["graphql_responses"].append(f"ERR: {str(e)[:300]}")
-            if i == 0:
-                # 未知错误也尝试抓 fresh lsd
-                fresh_lsd = _scrape_lsd(shortcode)
-                if fresh_lsd and fresh_lsd != LSD_FALLBACK:
-                    lsds_to_try.append(fresh_lsd)
-                continue
-            if debug:
-                return {"success": False, "error": str(e)[:200], "debug": debug_info, "version": VERSION}
-            return {"success": False, "error": str(e)[:200], "version": VERSION}
+                ml = _build_media_list(media)
+                if ml:
+                    dbg["steps"].append(f"json_embed: {len(ml)} media")
+                    caption_edges = media.get("edge_media_to_caption", {}).get("edges", [])
+                    caption = caption_edges[0]["node"]["text"] if caption_edges else ""
+                    owner = media.get("owner", {}).get("username", "")
+                    return {"success": True, "mediaList": ml,
+                            "title": caption[:80] if caption else "Instagram帖子",
+                            "author": f"@{owner}" if owner else "", "version": VERSION}
+            dbg["steps"].append("json_embed: not found")
 
-    if not result:
-        # 最后尝试：主动抓 fresh lsd 再试一次
-        fresh_lsd = _scrape_lsd(shortcode)
-        if fresh_lsd and fresh_lsd not in lsds_to_try:
-            debug_info["lsds_tried"].append(fresh_lsd)
-            try:
-                j = _graphql_query(shortcode, fresh_lsd)
-                if debug:
-                    debug_info["graphql_responses"].append(json.dumps(j)[:800])
-                media = (j.get("data") or {}).get("xdt_shortcode_media")
-                if media:
-                    result = _parse_ig_media(media)
-            except urllib.error.HTTPError as e:
-                body = e.read().decode()[:300]
-                debug_info["graphql_responses"].append(f"HTTP {e.code}: {body}")
-            except Exception as e:
-                debug_info["graphql_responses"].append(f"ERR: {str(e)[:300]}")
+            # A2: OG meta tags
+            og = _parse_og_meta(html)
+            if og.get("og_image") or og.get("og_video"):
+                ml = []
+                if og.get("og_video"):
+                    ml.append({"url": og["og_video"], "type": "video", "thumbnail": og.get("og_image", "")})
+                elif og.get("og_image"):
+                    ml.append({"url": og["og_image"], "type": "image", "thumbnail": og.get("og_image", "")})
+                dbg["steps"].append(f"og_meta: video={bool(og.get('og_video'))} image={bool(og.get('og_image'))}")
+                return {"success": True, "mediaList": ml,
+                        "title": og.get("og_title", "Instagram帖子")[:80],
+                        "author": "", "version": VERSION}
+            dbg["steps"].append("og_meta: not found")
+    except Exception as e:
+        dbg["steps"].append(f"fetch_err: {str(e)[:100]}")
 
-    if not result:
-        if debug:
-            return {"success": False, "error": "GraphQL 查询返回空数据", "debug": debug_info, "version": VERSION}
-        return {"success": False, "error": "GraphQL 查询返回空数据，帖子可能不存在或为私密账户", "version": VERSION}
-
-    return {"success": True, **result, "version": VERSION}
+    if debug:
+        return {"success": False, "error": "无法从页面提取媒体", "debug": dbg, "version": VERSION}
+    return {"success": False, "error": "无法从页面提取媒体（可能需要登录或帖子不存在）", "version": VERSION}
 
 
 @app.get("/")
